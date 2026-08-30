@@ -19,7 +19,7 @@ export default function JoinRoom() {
 
   useEffect(() => {
     if (roomId && token) {
-      navigate(`/room/${roomId}?token=${encodeURIComponent(token)}`, {  
+      navigate(`/room/${roomId}?token=${encodeURIComponent(token)}`, {
         replace: true,
         state: location.state,
       });
@@ -52,6 +52,16 @@ export default function JoinRoom() {
           <p className="hero-text">
             Open the invite link from the sender, or paste the room details manually if you received them another way. Once the room is validated, the browser connection is ready for file exchange.
           </p>
+          <div className="join-mini-strip" aria-label="Join status">
+            <div>
+              <strong>{roomId ? 'Room preset' : 'Manual join'}</strong>
+              <span>{roomId ? 'Room ID was loaded from the invite link.' : 'Paste the room ID and token below.'}</span>
+            </div>
+            <div>
+              <strong>Secure</strong>
+              <span>Only the sender can create and share the invite token.</span>
+            </div>
+          </div>
           <div className="join-notes">
             <div>
               <strong>Step 1</strong>
@@ -63,7 +73,7 @@ export default function JoinRoom() {
             </div>
             <div>
               <strong>Step 3</strong>
-              <span>You’ll land in the transfer room for direct file sharing.</span>
+              <span>You&apos;ll land in the transfer room for direct file sharing.</span>
             </div>
           </div>
         </div>
@@ -74,6 +84,10 @@ export default function JoinRoom() {
           <p className="section-copy">
             The room ID and token come from the invite link. If you opened the link, the fields will be prefilled.
           </p>
+          <div className="join-status-row">
+            <span>{roomId ? 'Invite link detected' : 'Waiting for invite link'}</span>
+            <span>{token ? 'Token ready' : 'Token needed'}</span>
+          </div>
           {location.state?.inviteLink ? (
             <div className="invite-box">
               <p>Invite link</p>

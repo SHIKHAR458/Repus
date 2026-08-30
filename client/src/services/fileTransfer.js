@@ -1,9 +1,20 @@
-export const CHUNK_SIZE = 256 * 1024;
+// The frame carries a 28-byte protocol header as well as file bytes. Keep the
+// complete RTCDataChannel message below the common 64 KB SCTP message ceiling.
+export const CHUNK_SIZE = 60 * 1024;
+export const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024;
+export const BUFFERED_AMOUNT_LOW_THRESHOLD = 1024 * 1024;
+export const ACK_INTERVAL_BYTES = 1024 * 1024;
+export const CHECKPOINT_INTERVAL_BYTES = 4 * 1024 * 1024;
 
 export const TRANSFER_TYPES = {
   META: 'file-meta',
   END: 'file-end',
+  ACK: 'file-ack',
 };
+
+const CHUNK_FRAME_MAGIC = 0x52505553;
+const CHUNK_FRAME_VERSION = 1;
+const CHUNK_FRAME_HEADER_SIZE = 28;
 
 const SHA256_K = new Uint32Array([
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
@@ -30,6 +41,7 @@ class Sha256 {
   constructor() {
     this.h = new Uint32Array(SHA256_H0);
     this.buffer = new Uint8Array(64);
+    this.words = new Uint32Array(64);
     this.bufferLength = 0;
     this.bytesHashed = 0;
   }
@@ -53,7 +65,7 @@ class Sha256 {
   }
 
   processChunk(chunk) {
-    const w = new Uint32Array(64);
+    const w = this.words;
 
     for (let i = 0; i < 16; i += 1) {
       const offset = i * 4;
@@ -129,7 +141,7 @@ class Sha256 {
 
 export const createSha256 = () => new Sha256();
 
-export const digestFileSha256 = async (file) => {
+const digestFileSha256OnMainThread = async (file) => {
   const hash = createSha256();
   const stream = file.stream().getReader();
 
@@ -140,6 +152,38 @@ export const digestFileSha256 = async (file) => {
   }
 
   return hash.digestHex();
+};
+
+export const digestFileSha256 = async (file) => {
+  if (typeof Worker === 'undefined') {
+    return digestFileSha256OnMainThread(file);
+  }
+
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./sha256.worker.js', import.meta.url), { type: 'module' });
+    const id = crypto.randomUUID();
+
+    const cleanup = () => worker.terminate();
+
+    worker.onmessage = ({ data }) => {
+      if (data?.id !== id) return;
+      cleanup();
+
+      if (data.error) {
+        reject(new Error(data.error));
+        return;
+      }
+
+      resolve(data.sha256);
+    };
+
+    worker.onerror = () => {
+      cleanup();
+      reject(new Error('Unable to calculate SHA-256 in a background worker.'));
+    };
+
+    worker.postMessage({ type: 'hash-file', id, file });
+  });
 };
 
 export const createControlMessage = (type, payload = {}) =>
@@ -160,16 +204,85 @@ export const parseControlMessage = (value) => {
   }
 };
 
+const transferIdToBytes = (transferId) => {
+  const compactId = transferId.replaceAll('-', '');
+  if (!/^[0-9a-f]{32}$/i.test(compactId)) {
+    throw new Error('Invalid transfer id.');
+  }
+
+  return Uint8Array.from(
+    { length: 16 },
+    (_, index) => Number.parseInt(compactId.slice(index * 2, index * 2 + 2), 16)
+  );
+};
+
+const bytesToTransferId = (bytes) => {
+  const value = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+};
+
+export const createChunkFrame = ({ transferId, sequenceNumber, data }) => {
+  const payload = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  const frame = new Uint8Array(CHUNK_FRAME_HEADER_SIZE + payload.byteLength);
+  const view = new DataView(frame.buffer);
+
+  view.setUint32(0, CHUNK_FRAME_MAGIC, false);
+  frame[4] = CHUNK_FRAME_VERSION;
+  view.setUint32(8, sequenceNumber, false);
+  frame.set(transferIdToBytes(transferId), 12);
+  frame.set(payload, CHUNK_FRAME_HEADER_SIZE);
+
+  return frame.buffer;
+};
+
+export const parseChunkFrame = (frame) => {
+  if (!(frame instanceof ArrayBuffer) || frame.byteLength < CHUNK_FRAME_HEADER_SIZE) {
+    return null;
+  }
+
+  const view = new DataView(frame);
+  if (view.getUint32(0, false) !== CHUNK_FRAME_MAGIC || new Uint8Array(frame)[4] !== CHUNK_FRAME_VERSION) {
+    return null;
+  }
+
+  return {
+    transferId: bytesToTransferId(new Uint8Array(frame, 12, 16)),
+    sequenceNumber: view.getUint32(8, false),
+    data: frame.slice(CHUNK_FRAME_HEADER_SIZE),
+  };
+};
+
 export const waitForBufferedAmount = async (
   channel,
-  maxBufferedAmount = CHUNK_SIZE * 8,
+  maxBufferedAmount = MAX_BUFFERED_AMOUNT,
   shouldStop = () => false
 ) => {
-  while (
-    channel.readyState === 'open' &&
-    channel.bufferedAmount > maxBufferedAmount &&
-    !shouldStop()
-  ) {
-    await new Promise((resolve) => window.setTimeout(resolve, 16));
+  channel.bufferedAmountLowThreshold = Math.min(
+    BUFFERED_AMOUNT_LOW_THRESHOLD,
+    maxBufferedAmount / 2
+  );
+
+  while (channel.readyState === 'open' && channel.bufferedAmount > maxBufferedAmount) {
+    if (shouldStop()) return;
+
+    await new Promise((resolve) => {
+      let fallbackTimer;
+
+      const cleanup = () => {
+        channel.removeEventListener('bufferedamountlow', handleLowBuffer);
+        window.clearTimeout(fallbackTimer);
+      };
+
+      const handleLowBuffer = () => {
+        cleanup();
+        resolve();
+      };
+
+      channel.addEventListener('bufferedamountlow', handleLowBuffer, { once: true });
+      fallbackTimer = window.setTimeout(() => {
+        cleanup();
+        resolve();
+      }, 50);
+    });
   }
 };
