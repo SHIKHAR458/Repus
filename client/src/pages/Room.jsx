@@ -51,6 +51,7 @@ export default function Room() {
   const incomingMetaRef = useRef(null);
   const receiveQueueRef = useRef(Promise.resolve());
   const receiverAckRef = useRef(-1);
+  const receiverHashRef = useRef(null);
   const senderHashPromiseRef = useRef(null);
   const lastSenderCheckpointRef = useRef(-1);
   const lastReceiverCheckpointRef = useRef(-1);
@@ -106,6 +107,7 @@ export default function Room() {
   const resetIncomingTransfer = () => {
     incomingMetaRef.current = null;
     receiverAckRef.current = -1;
+    receiverHashRef.current = null;
     setIncomingFile(null);
     setReceiveProgress(0);
     setIntegrityStatus('');
@@ -230,7 +232,12 @@ export default function Room() {
     const metadata = incomingMetaRef.current;
     if (!metadata) return;
 
-    const receivedHash = await digestStoredTransfer(metadata);
+    // Use the incrementally-computed hash when available, falling back to
+    // the slow re-read path only if the incremental hasher is missing
+    // (e.g. due to a page reload mid-transfer).
+    const receivedHash = receiverHashRef.current
+      ? receiverHashRef.current.digestHex()
+      : await digestStoredTransfer(metadata);
     const integrityOk = Boolean(expectedHash) && receivedHash === expectedHash;
 
     setDownloadFile({
@@ -294,6 +301,19 @@ export default function Room() {
       };
       incomingMetaRef.current = metadata;
       receiverAckRef.current = metadata.receivedThrough;
+
+      // Start an incremental SHA-256 hasher for this transfer.  When we
+      // are resuming, replay the already-persisted chunks into the hasher
+      // so the running digest stays correct.
+      const hash = createSha256();
+      if (canResumeStoredTransfer && metadata.receivedThrough >= 0) {
+        for (let seq = 0; seq <= metadata.receivedThrough; seq += 1) {
+          const stored = await getStoredChunk(metadata.transferId, seq);
+          if (stored) hash.update(new Uint8Array(stored));
+        }
+      }
+      receiverHashRef.current = hash;
+
       await saveTransferMetadata(metadata);
       setIncomingFile({
         name: metadata.name,
@@ -367,6 +387,12 @@ export default function Room() {
 
     metadata.receivedBytes += frame.data.byteLength;
     metadata.receivedThrough = frame.sequenceNumber;
+
+    // Feed the chunk into the incremental SHA-256 hasher.
+    if (receiverHashRef.current) {
+      receiverHashRef.current.update(new Uint8Array(frame.data));
+    }
+
     await saveReceivedChunk({
       transferId: metadata.transferId,
       sequenceNumber: frame.sequenceNumber,
