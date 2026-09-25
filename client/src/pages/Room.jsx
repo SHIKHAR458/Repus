@@ -18,10 +18,10 @@ import {
   waitForBufferedAmount,
 } from '../services/fileTransfer.js';
 import {
+  createChunkBatcher,
   getStoredChunk,
   getStoredTransfer,
   readTransferChunks,
-  saveReceivedChunk,
   saveTransferMetadata,
 } from '../services/transferStorage.js';
 
@@ -52,6 +52,7 @@ export default function Room() {
   const receiveQueueRef = useRef(Promise.resolve());
   const receiverAckRef = useRef(-1);
   const receiverHashRef = useRef(null);
+  const chunkBatcherRef = useRef(null);
   const senderHashPromiseRef = useRef(null);
   const lastSenderCheckpointRef = useRef(-1);
   const lastReceiverCheckpointRef = useRef(-1);
@@ -108,6 +109,7 @@ export default function Room() {
     incomingMetaRef.current = null;
     receiverAckRef.current = -1;
     receiverHashRef.current = null;
+    chunkBatcherRef.current = null;
     setIncomingFile(null);
     setReceiveProgress(0);
     setIntegrityStatus('');
@@ -314,6 +316,10 @@ export default function Room() {
       }
       receiverHashRef.current = hash;
 
+      // Create a chunk batcher so incoming chunks accumulate in memory and
+      // are flushed to IndexedDB in bulk (~32 at a time).
+      chunkBatcherRef.current = createChunkBatcher(metadata.transferId);
+
       await saveTransferMetadata(metadata);
       setIncomingFile({
         name: metadata.name,
@@ -335,6 +341,12 @@ export default function Room() {
 
     if (control?.type === TRANSFER_TYPES.END) {
       setReceiveProgress(100);
+
+      // Flush any remaining batched chunks to IndexedDB before verification.
+      if (chunkBatcherRef.current) {
+        await chunkBatcherRef.current.flush();
+      }
+
       await finalizeIncomingFile(control.sha256);
       if (incomingMetaRef.current) {
         await saveTransferMetadata({
@@ -393,12 +405,11 @@ export default function Room() {
       receiverHashRef.current.update(new Uint8Array(frame.data));
     }
 
-    await saveReceivedChunk({
-      transferId: metadata.transferId,
-      sequenceNumber: frame.sequenceNumber,
-      data: frame.data,
-      metadata,
-    });
+    // Batch the chunk in memory — the batcher auto-flushes to IndexedDB
+    // every 32 chunks instead of writing each one individually.
+    if (chunkBatcherRef.current) {
+      chunkBatcherRef.current.add(frame.sequenceNumber, frame.data, metadata);
+    }
 
     const progress = Math.min(
       100,
@@ -667,7 +678,18 @@ export default function Room() {
 
         const start = index * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, activeFile.size);
-        const chunk = await activeFile.slice(start, end).arrayBuffer();
+
+        // Pre-read the next chunk while we wait for the current one to be
+        // sent, overlapping disk I/O with network I/O.
+        const chunkPromise = activeFile.slice(start, end).arrayBuffer();
+        const nextIndex = index + 1;
+        let nextChunkPromise = null;
+        if (nextIndex < totalChunks && !isPausedRef.current) {
+          const nextStart = nextIndex * CHUNK_SIZE;
+          const nextEnd = Math.min(nextStart + CHUNK_SIZE, activeFile.size);
+          nextChunkPromise = activeFile.slice(nextStart, nextEnd).arrayBuffer();
+        }
+        const chunk = await chunkPromise;
 
         if (isPausedRef.current) {
           sendStateRef.current.nextChunkIndex = index;

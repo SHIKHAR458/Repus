@@ -27,6 +27,17 @@ self.onmessage = async ({ data }) => {
   if (data?.type !== 'hash-file') return;
 
   try {
+    // Prefer hardware-accelerated crypto.subtle (5-20× faster than pure JS).
+    if (typeof crypto !== 'undefined' && crypto.subtle) {
+      const buffer = await data.file.arrayBuffer();
+      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+      const hex = Array.from(new Uint8Array(hashBuffer))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+      self.postMessage({ id: data.id, sha256: hex });
+      return;
+    }
+
     const hash = createSha256();
     const reader = data.file.stream().getReader();
 

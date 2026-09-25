@@ -118,3 +118,90 @@ export const clearStoredTransfer = async (transferId) => {
   transaction.objectStore(TRANSFERS_STORE).delete(transferId);
   await completeTransaction(transaction);
 };
+
+// ---------------------------------------------------------------------------
+// ChunkBatcher – accumulates received chunks in memory and flushes them to
+// IndexedDB in a single transaction every `batchSize` chunks.  This reduces
+// the number of IndexedDB transactions by ~95% and removes the main
+// bottleneck for receive throughput.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_BATCH_SIZE = 32;
+
+export const createChunkBatcher = (transferId, batchSize = DEFAULT_BATCH_SIZE) => {
+  const pending = [];
+  let latestMetadata = null;
+  let flushing = false;
+
+  const flushToDb = async () => {
+    if (flushing || pending.length === 0) return;
+    flushing = true;
+
+    // Drain the pending queue into a local snapshot so new chunks can still
+    // accumulate while we write.
+    const batch = pending.splice(0, pending.length);
+    const meta = latestMetadata;
+
+    try {
+      const database = await getDatabase();
+      const transaction = database.transaction(
+        [TRANSFERS_STORE, CHUNKS_STORE],
+        'readwrite'
+      );
+
+      const chunkStore = transaction.objectStore(CHUNKS_STORE);
+      for (const chunk of batch) {
+        chunkStore.put({
+          transferId,
+          sequenceNumber: chunk.sequenceNumber,
+          data: chunk.data,
+        });
+      }
+
+      if (meta) {
+        transaction.objectStore(TRANSFERS_STORE).put({
+          ...meta,
+          transferId,
+          receivedThrough: meta.receivedThrough,
+          receivedBytes: meta.receivedBytes,
+          updatedAt: Date.now(),
+        });
+      }
+
+      await completeTransaction(transaction);
+    } finally {
+      flushing = false;
+    }
+  };
+
+  return {
+    /** Add a chunk to the in-memory batch.  Automatically flushes when
+     *  `batchSize` chunks have accumulated. */
+    add(sequenceNumber, data, metadata) {
+      pending.push({ sequenceNumber, data });
+      latestMetadata = metadata;
+
+      if (pending.length >= batchSize) {
+        // Fire-and-forget — the next flush or explicit flush() call will
+        // pick up anything that couldn't be written in time.
+        void flushToDb();
+      }
+    },
+
+    /** Force-flush any remaining chunks to IndexedDB (call on transfer
+     *  completion or before verification). */
+    async flush() {
+      await flushToDb();
+      // If a concurrent flush was in progress when we entered, the pending
+      // queue may still have items.  Drain until empty.
+      while (pending.length > 0) {
+        await flushToDb();
+      }
+    },
+
+    /** Number of chunks waiting in memory. */
+    get pendingCount() {
+      return pending.length;
+    },
+  };
+};
