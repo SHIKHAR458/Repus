@@ -1,9 +1,9 @@
-// Modern browsers reliably handle 256 KB+ SCTP messages via internal
-// fragmentation.  Larger chunks reduce per-chunk overhead (IndexedDB writes,
-// framing, ACKs) and dramatically improve throughput.
-export const CHUNK_SIZE = 256 * 1024;
-export const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024;
-export const BUFFERED_AMOUNT_LOW_THRESHOLD = 4 * 1024 * 1024;
+// WebRTC DataChannels often have a max-message-size limit of 64KB depending on
+// the browser/implementation. We keep chunks at 60KB to safely fit within this
+// limit while including frame headers.
+export const CHUNK_SIZE = 60 * 1024;
+export const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024;
+export const BUFFERED_AMOUNT_LOW_THRESHOLD = 1 * 1024 * 1024;
 export const ACK_INTERVAL_BYTES = 2 * 1024 * 1024;
 export const CHECKPOINT_INTERVAL_BYTES = 8 * 1024 * 1024;
 
@@ -269,12 +269,16 @@ export const waitForBufferedAmount = async (
   maxBufferedAmount = MAX_BUFFERED_AMOUNT,
   shouldStop = () => false
 ) => {
+  if (channel.readyState !== 'open' || channel.bufferedAmount <= maxBufferedAmount) {
+    return;
+  }
+
   channel.bufferedAmountLowThreshold = Math.min(
     BUFFERED_AMOUNT_LOW_THRESHOLD,
     maxBufferedAmount / 2
   );
 
-  while (channel.readyState === 'open' && channel.bufferedAmount > maxBufferedAmount) {
+  while (channel.readyState === 'open' && channel.bufferedAmount > channel.bufferedAmountLowThreshold) {
     if (shouldStop()) return;
 
     await new Promise((resolve) => {
@@ -291,10 +295,13 @@ export const waitForBufferedAmount = async (
       };
 
       channel.addEventListener('bufferedamountlow', handleLowBuffer, { once: true });
+      
+      // Provide a reasonable fallback so we don't hang if the event is missed,
+      // but long enough to actually let the network drain.
       fallbackTimer = window.setTimeout(() => {
         cleanup();
         resolve();
-      }, 16);
+      }, 50);
     });
   }
 };

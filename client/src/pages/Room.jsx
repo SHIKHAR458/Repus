@@ -715,9 +715,11 @@ export default function Room() {
           })
         );
 
+        const totalPushedBytes = (index + 1) * CHUNK_SIZE;
+        const actualSentBytes = Math.max(0, totalPushedBytes - channel.bufferedAmount);
         const progress = Math.min(
           100,
-          Math.round(((index + 1) / totalChunks) * 100)
+          Math.round((actualSentBytes / activeFile.size) * 100)
         );
         sendStateRef.current.nextChunkIndex = index + 1;
         const now = Date.now();
