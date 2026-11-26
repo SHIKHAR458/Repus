@@ -15,4 +15,5 @@ app.get('/' , (req,res) => {
     res.send("server is running")
 })
 
+//Exporting the app 
 export default app;
